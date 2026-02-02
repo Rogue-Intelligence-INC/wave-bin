@@ -1,0 +1,291 @@
+// ============================================
+// Wave-BIN Self-Hosting Compiler (written in Wave)
+// Version: 1.0-alpha Bootstrap
+// Author: Rogue Intelligence LNC.
+// ============================================
+// Input: /tmp/input.wave -> Output: /tmp/boot.bin (512-byte boot sector)
+
+// ---- Unified Field ----
+uf_i = 50
+uf_e = 50
+uf_r = 50
+
+// ---- Global State ----
+src = 0
+pos = 0
+code_base = 0
+code_ptr = 0
+tok_type = 0
+tok_val = 0
+tok_buf = 0
+
+fn init {
+    code_base = syscall.mmap(0, 512, 3, 0x22, -1, 0)
+    tok_buf = syscall.mmap(0, 256, 3, 0x22, -1, 0)
+    code_ptr = 0
+}
+
+// ---- Emit Helpers ----
+fn emit b {
+    poke(code_base + code_ptr, b)
+    code_ptr = code_ptr + 1
+}
+
+fn emit2 a b { emit(a) emit(b) }
+fn emit3 a b c { emit(a) emit(b) emit(c) }
+
+// ---- String Ops ----
+fn streq a b {
+    i = 0
+    loop {
+        ca = peek(a + i)
+        cb = peek(b + i)
+        when ca != cb { -> 0 }
+        when ca == 0 { -> 1 }
+        i = i + 1
+    }
+}
+
+fn strlen s {
+    n = 0
+    loop {
+        when peek(s + n) == 0 { -> n }
+        n = n + 1
+    }
+}
+
+// ---- File I/O ----
+fn read_src path {
+    fd = syscall.open(path, 0, 0)
+    when fd < 0 {
+        out "Error: cannot open input\n"
+        syscall.exit(1)
+    }
+    buf = syscall.mmap(0, 65536, 3, 0x22, -1, 0)
+    n = syscall.read(fd, buf, 65536)
+    syscall.close(fd)
+    poke(buf + n, 0)
+    -> buf
+}
+
+fn write_out path {
+    fd = syscall.open(path, 0x241, 0x1B4)
+    when fd < 0 {
+        out "Error: cannot create output\n"
+        syscall.exit(1)
+    }
+    syscall.write(fd, code_base, 512)
+    syscall.close(fd)
+}
+
+// ---- Lexer ----
+fn skip_ws {
+    loop {
+        c = peek(src + pos)
+        when c == 32 { pos = pos + 1 }
+        when c == 9 { pos = pos + 1 }
+        when c == 10 { pos = pos + 1 }
+        when c == 13 { pos = pos + 1 }
+        when c == 47 {
+            c2 = peek(src + pos + 1)
+            when c2 == 47 {
+                pos = pos + 2
+                loop {
+                    cc = peek(src + pos)
+                    when cc == 0 { -> 0 }
+                    when cc == 10 { pos = pos + 1 -> 0 }
+                    pos = pos + 1
+                }
+            }
+            when c2 != 47 { -> 0 }
+        }
+        when c != 32 {
+            when c != 9 {
+                when c != 10 {
+                    when c != 13 {
+                        when c != 47 { -> 0 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_alpha c {
+    when c >= 65 { when c <= 90 { -> 1 } }
+    when c >= 97 { when c <= 122 { -> 1 } }
+    when c == 95 { -> 1 }
+    -> 0
+}
+
+fn is_digit c {
+    when c >= 48 { when c <= 57 { -> 1 } }
+    -> 0
+}
+
+fn next_tok {
+    skip_ws()
+    c = peek(src + pos)
+    when c == 0 { tok_type = 0 -> 0 }
+    
+    when is_digit(c) {
+        tok_type = 1
+        tok_val = 0
+        loop {
+            cc = peek(src + pos)
+            when is_digit(cc) == 0 { -> 1 }
+            tok_val = tok_val * 10 + cc - 48
+            pos = pos + 1
+        }
+    }
+    
+    when is_alpha(c) {
+        tok_type = 2
+        i = 0
+        loop {
+            cc = peek(src + pos)
+            a = is_alpha(cc)
+            d = is_digit(cc)
+            when a == 0 {
+                when d == 0 {
+                    poke(tok_buf + i, 0)
+                    -> 2
+                }
+            }
+            poke(tok_buf + i, cc)
+            i = i + 1
+            pos = pos + 1
+        }
+    }
+    
+    when c == 34 {
+        tok_type = 3
+        pos = pos + 1
+        i = 0
+        loop {
+            cc = peek(src + pos)
+            when cc == 34 {
+                pos = pos + 1
+                poke(tok_buf + i, 0)
+                -> 3
+            }
+            when cc == 92 {
+                pos = pos + 1
+                nc = peek(src + pos)
+                when nc == 110 { poke(tok_buf + i, 10) }
+                when nc != 110 { poke(tok_buf + i, nc) }
+            }
+            when cc != 92 { poke(tok_buf + i, cc) }
+            i = i + 1
+            pos = pos + 1
+        }
+    }
+    
+    tok_type = 4
+    tok_val = c
+    pos = pos + 1
+    -> 4
+}
+
+// ---- x86 Real Mode Gen ----
+fn emit_boot_header {
+    emit2(0xEB, 0x3C)  // jmp short start (skip BPB)
+    // BPB padding
+    i = 0
+    loop {
+        when i >= 60 { -> 0 }
+        emit(0x00)
+        i = i + 1
+    }
+}
+
+fn emit_bios_putchar c {
+    emit2(0xB4, 0x0E)  // mov ah, 0x0E
+    emit2(0xB0, c)     // mov al, char
+    emit2(0xB7, 0x00)  // mov bh, 0
+    emit2(0xCD, 0x10)  // int 0x10
+}
+
+fn emit_bios_print s {
+    i = 0
+    loop {
+        c = peek(s + i)
+        when c == 0 { -> 0 }
+        emit_bios_putchar(c)
+        i = i + 1
+    }
+}
+
+fn emit_halt {
+    emit(0xFA)  // cli
+    emit(0xF4)  // hlt
+}
+
+fn pad_to_512 {
+    loop {
+        when code_ptr >= 510 { -> 0 }
+        emit(0x00)
+    }
+    emit2(0x55, 0xAA)  // Boot signature
+}
+
+// ---- Parse ----
+fn parse_stmt {
+    next_tok()
+    when tok_type == 0 { -> -1 }
+    
+    when tok_type == 2 {
+        kw = tok_buf
+        // 'out'
+        when peek(kw) == 111 {
+            when peek(kw + 1) == 117 {
+                when peek(kw + 2) == 116 {
+                    next_tok()
+                    when tok_type == 3 {
+                        emit_bios_print(tok_buf)
+                    }
+                    -> 0
+                }
+            }
+        }
+        
+        // 'halt'
+        when peek(kw) == 104 {
+            when peek(kw + 1) == 97 {
+                when peek(kw + 2) == 108 {
+                    emit_halt()
+                    -> 0
+                }
+            }
+        }
+    }
+    
+    -> 0
+}
+
+// ---- Compile ----
+fn compile {
+    init()
+    src = read_src("/tmp/input.wave")
+    pos = 0
+    
+    emit_boot_header()
+    
+    loop {
+        r = parse_stmt()
+        when r < 0 { -> 0 }
+    }
+    
+    emit_halt()
+    pad_to_512()
+    
+    write_out("/tmp/boot.bin")
+    out "Wave-BIN Bootstrap: /tmp/boot.bin (512 bytes)\n"
+}
+
+// ---- Main ----
+out "🌊 Wave-BIN Bootstrap Compiler\n"
+out "   Self-Hosting | Rogue Intelligence LNC.\n\n"
+
+compile()
+syscall.exit(0)
